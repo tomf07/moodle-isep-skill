@@ -162,7 +162,7 @@ def main():
     if args.list or not courses:
         print(f"{len(courses)} cadeira(s):")
         for c in courses:
-            print(f"  [{c['id']}] {c.get('shortname')} — {c.get('fullname')}")
+            print(f"  [{c['id']}] {c.get('shortname')} - {c.get('fullname')}")
         return
 
     new = updated = skipped = failed = 0
