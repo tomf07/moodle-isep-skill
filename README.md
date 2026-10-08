@@ -20,6 +20,8 @@ In Claude Code, type `/moodle` or just ask normally:
 - "get me the latest BDDAD slides"
 - "anything new on moodle?"
 - "solve exercise 2 from the ARQCP PL sheet"
+- "any new announcements?"
+- "did the teacher answer the USEI05 question in the ESINF forum?"
 
 You can also run the script on its own:
 
@@ -29,7 +31,12 @@ python3 scripts/moodle_sync.py -c ESINF    # sync one course
 python3 scripts/moodle_sync.py             # sync all current courses
 python3 scripts/moodle_sync.py --dry-run   # show what it would download
 python3 scripts/moodle_sync.py --all       # include past courses too
+
+python3 scripts/moodle_sync.py --forums                     # forum posts from the last 14 days
+python3 scripts/moodle_sync.py --forums -c ESINF --since 30d
 ```
+
+`--forums` prints recent discussions with every post in order, and saves any attachments next to the course files. `--since` takes things like `24h`, `7d`, `2w`, `2026-09-01` or `all`. It only reads, it never posts.
 
 Files land in `~/Documents/ISEP/Moodle/<course>/<section>/`. Use `-o <folder>` if you want them somewhere else.
 

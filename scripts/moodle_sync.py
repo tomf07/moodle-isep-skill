@@ -8,16 +8,20 @@ Usa a API da app mobile do Moodle. Só descarrega o que é novo ou foi alterado.
     python3 moodle_sync.py --list     # só mostra as cadeiras
     python3 moodle_sync.py -c ESINF   # só cadeiras cujo nome contém "ESINF"
     python3 moodle_sync.py --dry-run  # mostra o que ia sacar sem sacar
+    python3 moodle_sync.py --forums   # anúncios/discussões recentes (--since 14d por defeito)
+    python3 moodle_sync.py --forums -c ESINF --since 30d
     python3 moodle_sync.py --login    # (re)faz login e guarda o token
     python3 moodle_sync.py --logout   # apaga o token guardado
 """
 import argparse
 import getpass
+import html
 import json
 import os
 import re
 import sys
 import time
+from datetime import datetime
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -130,6 +134,102 @@ def iter_files(sections):
                 yield rel, f
 
 
+def html_to_text(s):
+    s = re.sub(r"\s+", " ", s or "")  # quebras de linha no HTML não contam
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</h\d>", "\n", s or "")
+    s = re.sub(r"(?i)<li[^>]*>", "- ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = html.unescape(s).replace("\xa0", " ")
+    s = "\n".join(line.strip() for line in s.split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+def parse_since(v):
+    if v == "all":
+        return 0
+    m = re.fullmatch(r"(\d+)([hdw])", v)
+    if m:
+        n, unit = int(m[1]), m[2]
+        return time.time() - n * {"h": 3600, "d": 86400, "w": 604800}[unit]
+    return datetime.strptime(v, "%Y-%m-%d").timestamp()
+
+
+def fmt_time(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def forums(m, courses, needles, since, args):
+    """Mostra discussões dos fóruns modificadas desde `since` e saca os anexos dos posts."""
+    by_id = {c["id"]: c for c in courses}
+    params = {f"courseids[{i}]": c["id"] for i, c in enumerate(courses)}
+    shown = files = 0
+    for fo in m.call("mod_forum_get_forums_by_courses", **params):
+        c = by_id.get(fo["course"], {})
+        cname = clean(c.get("shortname") or str(fo["course"]))
+        hay = f"{c.get('shortname', '')} {c.get('fullname', '')} {fo['name']}".lower()
+        if needles and not any(n in hay for n in needles):
+            continue
+        if not fo.get("numdiscussions"):
+            continue
+
+        header_done = False
+        page = 0
+        while True:
+            res = m.call("mod_forum_get_forum_discussions", forumid=fo["id"], page=page, perpage=25)
+            ds = res.get("discussions", [])
+            if not ds:
+                break
+            stop = False
+            for d in ds:
+                last = max(d.get("timemodified") or 0, d.get("modified") or 0)
+                if last < since:
+                    # Ordenadas por último post; as afixadas vêm primeiro, por isso só paramos nas outras
+                    if not d.get("pinned"):
+                        stop = True
+                    continue
+                if not header_done:
+                    print(f"\n######## {cname} / {fo['name']}")
+                    header_done = True
+                shown += 1
+                files += print_discussion(m, d, args.out / cname / "Forum" / clean(fo["name"]), args)
+            if stop or len(ds) < 25:
+                break
+            page += 1
+    print(f"\n{shown} discussão(ões) desde {fmt_time(since) if since else 'sempre'}, {files} anexo(s) novo(s).")
+
+
+def print_discussion(m, d, folder, args):
+    posts = m.call("mod_forum_get_discussion_posts", discussionid=d["discussion"],
+                   sortby="created", sortdirection="ASC")["posts"]
+    pin = " [afixado]" if d.get("pinned") else ""
+    print(f"\n=== {d['name']}{pin}  ({len(posts)} post(s))")
+    print(f"    {posts[0]['urls']['discuss'] if posts else ''}")
+    downloaded = 0
+    for p in posts:
+        indent = "    " if p.get("hasparent") else ""
+        print(f"\n{indent}--- {p['author']['fullname']} · {fmt_time(p['timecreated'])}")
+        text = html_to_text(p["message"])
+        if args.max_chars and len(text) > args.max_chars:
+            text = text[:args.max_chars] + " [...]"
+        print("\n".join(indent + line for line in text.splitlines()))
+        for a in p.get("attachments") or []:
+            dest = folder / clean(d["name"]) / clean(a["filename"])
+            print(f"{indent}    [anexo] {dest}")
+            if dest.exists() or args.dry_run:
+                continue
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                # Anexos de posts vêm com `url` (pluginfile.php); com token tem de ser webservice/pluginfile.php
+                url = a.get("fileurl") or a["url"]
+                if "/webservice/pluginfile.php" not in url:
+                    url = url.replace("/pluginfile.php", "/webservice/pluginfile.php", 1)
+                m.download(url, dest, a.get("timemodified") or 0)
+                downloaded += 1
+            except Exception as e:
+                print(f"{indent}      ! falhou: {e}")
+    return downloaded
+
+
 def main():
     ap = argparse.ArgumentParser(description="Sacar ficheiros do Moodle do ISEP")
     ap.add_argument("-o", "--out", type=Path, default=DEFAULT_OUT)
@@ -137,6 +237,9 @@ def main():
     ap.add_argument("--all", action="store_true", help="incluir cadeiras antigas")
     ap.add_argument("--list", action="store_true", help="só listar cadeiras")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--forums", action="store_true", help="ler fóruns em vez de sacar ficheiros")
+    ap.add_argument("--since", default="14d", help="com --forums: 7d, 24h, 2w, 2026-09-01 ou all (default 14d)")
+    ap.add_argument("--max-chars", type=int, default=3000, help="com --forums: corta posts maiores (0 = sem limite)")
     ap.add_argument("--login", action="store_true")
     ap.add_argument("--logout", action="store_true")
     args = ap.parse_args()
@@ -153,6 +256,10 @@ def main():
 
     m = Moodle(get_token())
     courses = m.courses(args.all)
+    if args.forums:
+        # O filtro também apanha nomes de fóruns (ex: o fórum "ESINF" dentro da página SEM_3_PI)
+        forums(m, courses, [n.lower() for n in args.course or []], parse_since(args.since), args)
+        return
     if args.course:
         needles = [n.lower() for n in args.course]
         courses = [c for c in courses
